@@ -1,0 +1,279 @@
+diff --git a/README.md b/README.md
+index 34e34020..d0a8acfc 100644
+--- a/README.md
++++ b/README.md
+@@ -103,6 +103,13 @@ If you need more options or need to browse via a reverse proxy, please read:
+ 
+ https://github.com/louislam/uptime-kuma/wiki/%F0%9F%94%A7-How-to-Install
+ 
++## Environment Variables
++
++- UPTIMEKUMA_WH_MAX_MONITORS: Optional global limit for total monitors. If set to a positive integer, adding new monitors is blocked once the count reaches this value.
++- UPTIMEKUMA_WH_MIN_INTERVAL: Optional minimum allowed monitor interval in seconds. If set to a positive integer, monitor validation enforces this as the lower bound. Defaults to 20 seconds when unset.
++- UPTIMEKUMA_WH_MAX_KEEP_DAYS: Optional maximum allowed data retention in days. If set to a positive integer, settings cannot exceed this value and infinite retention (0) is disallowed.
++- UPTIMEKUMA_WH_USERNAME / UPTIMEKUMA_WH_PASSWORD: Optional auto-login credentials for white‑label hosting environments.
++
+ ## 🆙 How to Update
+ 
+ Please read:
+@@ -192,5 +199,3 @@ If you want to translate Uptime Kuma into your language, please visit [Weblate R
+ 
+ Feel free to correct the grammar in the documentation or code.
+ My mother language is not English and my grammar is not that great.
+-
+-
+diff --git a/docker/debian-base.dockerfile b/docker/debian-base.dockerfile
+index a1717437..0dfc3c1c 100644
+--- a/docker/debian-base.dockerfile
++++ b/docker/debian-base.dockerfile
+@@ -45,14 +45,8 @@ RUN apt update && \
+     rm -f apprise.deb && \
+     apt --yes autoremove
+ 
+-# Install cloudflared
+-RUN curl https://pkg.cloudflare.com/cloudflare-main.gpg --output /usr/share/keyrings/cloudflare-main.gpg && \
+-    echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bullseye main' | tee /etc/apt/sources.list.d/cloudflared.list && \
+-    apt update && \
+-    apt install --yes --no-install-recommends -t stable cloudflared && \
+-    cloudflared version && \
+-    rm -rf /var/lib/apt/lists/* && \
+-    apt --yes autoremove
++## cloudflared intentionally not installed in image
++## (keep empty to avoid including cloudflared by default)
+ 
+ # For nscd
+ COPY ./docker/etc/nscd.conf /etc/nscd.conf
+diff --git a/docker/dockerfile b/docker/dockerfile
+index d55f94f6..fc77e1af 100644
+--- a/docker/dockerfile
++++ b/docker/dockerfile
+@@ -18,9 +18,15 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
+ COPY --chown=node:node .npmrc .npmrc
+ COPY --chown=node:node package.json package.json
+ COPY --chown=node:node package-lock.json package-lock.json
+-RUN npm ci --omit=dev
+-COPY . .
++# Install full deps to allow building the frontend
++RUN npm ci
++# Ensure all project files are owned by `node` to avoid permission issues
++COPY --chown=node:node . .
+ COPY --chown=node:node --from=build_healthcheck /app/extra/healthcheck /app/extra/healthcheck
++# Build the frontend so dist/index.html exists for the server
++RUN npm run build
++# Prune dev dependencies to slim the final image content we copy
++RUN npm prune --omit=dev
+ RUN mkdir ./data
+ 
+ ############################################
+@@ -33,6 +39,13 @@ LABEL org.opencontainers.image.source="https://github.com/louislam/uptime-kuma"
+ 
+ ENV UPTIME_KUMA_IS_CONTAINER=1
+ 
++# Ensure cloudflared is not present in the final image
++# Useful when BASE_IMAGE already includes cloudflared
++RUN (apt update || true) \
++    && (apt --yes purge cloudflared || true) \
++    && rm -rf /var/lib/apt/lists/* \
++    && (apt --yes autoremove || true)
++
+ # Copy app files from build layer
+ COPY --chown=node:node --from=build /app /app
+ 
+@@ -111,4 +124,3 @@ RUN chmod +x /app/extra/upload-github-release-asset.sh
+ # Dist only
+ RUN cd /app && tar -zcvf $DIST dist
+ RUN /app/extra/upload-github-release-asset.sh github_api_token=$GITHUB_TOKEN owner=louislam repo=uptime-kuma tag=$VERSION filename=/app/$DIST
+-
+diff --git a/server/client.js b/server/client.js
+index 72f0a4e8..35194b52 100644
+--- a/server/client.js
++++ b/server/client.js
+@@ -154,6 +154,7 @@ async function sendInfo(socket, hideVersion = false) {
+         dbType = Database.dbConfig.type;
+     }
+ 
++    const envMaxKeepDays = parseInt(process.env.UPTIMEKUMA_WH_MAX_KEEP_DAYS || "");
+     socket.emit("info", {
+         version,
+         latestVersion,
+@@ -162,6 +163,7 @@ async function sendInfo(socket, hideVersion = false) {
+         primaryBaseURL: await setting("primaryBaseURL"),
+         serverTimezone: await server.getTimezone(),
+         serverTimezoneOffset: server.getTimezoneOffset(),
++        whMaxKeepDays: (Number.isFinite(envMaxKeepDays) && envMaxKeepDays > 0) ? envMaxKeepDays : undefined,
+     });
+ }
+ 
+diff --git a/server/jobs/clear-old-data.js b/server/jobs/clear-old-data.js
+index cfd65a8a..42de48e4 100644
+--- a/server/jobs/clear-old-data.js
++++ b/server/jobs/clear-old-data.js
+@@ -30,19 +30,32 @@ const clearOldData = async () => {
+         parsedPeriod = DEFAULT_KEEP_PERIOD;
+     }
+ 
+-    if (parsedPeriod < 1) {
+-        log.info("clearOldData", `Data deletion has been disabled as period is less than 1. Period is ${parsedPeriod} days.`);
++    // Apply optional max cap via env (white-label hosting)
+ 
+[... omitted 0 of 240 lines ...]
+
+urOffset();
+ 
+         try {
+             // Heartbeat
+             await R.exec("DELETE FROM heartbeat WHERE time < " + sqlHourOffset, [
+-                parsedPeriod * -24,
++                effectivePeriod * -24,
+             ]);
+ 
+-            let timestamp = dayjs().subtract(parsedPeriod, "day").utc().startOf("day").unix();
++            let timestamp = dayjs().subtract(effectivePeriod, "day").utc().startOf("day").unix();
+ 
+             // stat_daily
+             await R.exec("DELETE FROM stat_daily WHERE timestamp < ? ", [
+diff --git a/server/model/monitor.js b/server/model/monitor.js
+index 741fb940..012c0200 100644
+--- a/server/model/monitor.js
++++ b/server/model/monitor.js
+@@ -1480,12 +1480,17 @@ class Monitor extends BeanModel {
+      * @throws Interval is outside of range
+      */
+     validate() {
++        // Allow overriding the minimum interval via environment variable
++        // If not set or invalid, fall back to the default MIN_INTERVAL_SECOND
++        const envMin = parseInt(process.env.UPTIMEKUMA_WH_MIN_INTERVAL || "");
++        const minInterval = Number.isFinite(envMin) && envMin > 0 ? envMin : MIN_INTERVAL_SECOND;
++
++        if (this.interval < minInterval) {
++            throw new Error(`Interval cannot be less than ${minInterval} seconds`);
++        }
+         if (this.interval > MAX_INTERVAL_SECOND) {
+             throw new Error(`Interval cannot be more than ${MAX_INTERVAL_SECOND} seconds`);
+         }
+-        if (this.interval < MIN_INTERVAL_SECOND) {
+-            throw new Error(`Interval cannot be less than ${MIN_INTERVAL_SECOND} seconds`);
+-        }
+ 
+         if (this.type === "ping") {
+             // ping parameters validation
+diff --git a/server/server.js b/server/server.js
+index cba02174..53cfe9dd 100644
+--- a/server/server.js
++++ b/server/server.js
+@@ -701,6 +701,20 @@ let needSetup = false;
+         socket.on("add", async (monitor, callback) => {
+             try {
+                 checkLogin(socket);
++
++                // Enforce optional global max monitors via env
++                const maxMonitorsEnv = process.env.UPTIMEKUMA_WH_MAX_MONITORS;
++                if (maxMonitorsEnv && !isNaN(parseInt(maxMonitorsEnv))) {
++                    const maxMonitors = parseInt(maxMonitorsEnv);
++                    const currentCount = (await R.knex("monitor").count("id as count").first()).count;
++                    if (currentCount >= maxMonitors) {
++                        callback({
++                            ok: false,
++                            msg: `Monitor limit reached (${maxMonitors}).`,
++                        });
++                        return;
++                    }
++                }
+                 let bean = R.dispense("monitor");
+ 
+                 let notificationIDList = monitor.notificationIDList;
+@@ -1380,6 +1394,22 @@ let needSetup = false;
+                 const previousChromeExecutable = await Settings.get("chromeExecutable");
+                 const previousNSCDStatus = await Settings.get("nscd");
+ 
++                // Enforce optional maximum data retention via env
++                const envMaxKeepStr = process.env.UPTIMEKUMA_WH_MAX_KEEP_DAYS;
++                const envMaxKeep = parseInt(envMaxKeepStr || "");
++                if (Number.isFinite(envMaxKeep) && envMaxKeep > 0 && data && Object.prototype.hasOwnProperty.call(data, "keepDataPeriodDays")) {
++                    const requested = parseInt(data.keepDataPeriodDays);
++                    if (!Number.isFinite(requested)) {
++                        throw new Error("Invalid value for keepDataPeriodDays");
++                    }
++                    if (requested <= 0) {
++                        throw new Error(`Data retention cannot be infinite when capped. Max is ${envMaxKeep} days.`);
++                    }
++                    if (requested > envMaxKeep) {
++                        throw new Error(`Data retention cannot be more than ${envMaxKeep} days.`);
++                    }
++                }
++
+                 await setSettings("general", data);
+                 server.entryPage = data.entryPage;
+ 
+@@ -1736,12 +1766,24 @@ async function initDatabase(testMode = false) {
+         log.debug("server", "Load JWT secret from database.");
+     }
+ 
+-    // If there is no record in user table, it is a new Uptime Kuma instance, need to setup
+-    if ((await R.knex("user").count("id as count").first()).count === 0) {
+-        log.info("server", "No user, need setup");
+-        needSetup = true;
++    // Auto-create user from env if provided and not existing
++    const autoUser = process.env.UPTIMEKUMA_WH_USERNAME;
++    const autoPass = process.env.UPTIMEKUMA_WH_PASSWORD;
++    if (autoUser && autoPass) {
++        let existing = await R.findOne("user", " username = ? AND active = 1 ", [ autoUser ]);
++        if (!existing) {
++            let user = R.dispense("user");
++            user.username = autoUser;
++            user.password = passwordHash.generate(autoPass);
++            await R.store(user);
++            log.info("server", `Auto-created user '${autoUser}' from environment.`);
++        }
+     }
+ 
++    // Determine if setup is needed after possible auto-creation
++    const userCount = (await R.knex("user").count("id as count").first()).count;
++    needSetup = userCount === 0;
++
+     server.jwtSecret = jwtSecretBean.value;
+ }
+ 
+diff --git a/server/setup-database.js b/server/setup-database.js
+index 483f2c9a..39709921 100644
+--- a/server/setup-database.js
++++ b/server/setup-database.js
+@@ -63,7 +63,12 @@ class SetupDatabase {
+                     type: "sqlite",
+                 });
+             } else {
+-                this.needSetup = true;
++                // Default to SQLite for first run if nothing is configured
++                this.needSetup = false;
++                log.info("setup-database", "Defaulting to SQLite, generate db-config.json");
++                Database.writeDBConfig({
++                    type: "sqlite",
++                });
+             }
+             dbConfig = {};
+         }
+diff --git a/src/components/settings/MonitorHistory.vue b/src/components/settings/MonitorHistory.vue
+index 25e3e155..3bf0b476 100644
+--- a/src/components/settings/MonitorHistory.vue
++++ b/src/components/settings/MonitorHistory.vue
+@@ -7,7 +7,9 @@
+                         settings.keepDataPeriodDays,
+                     ])
+                 }}
+-                {{ $t("infiniteRetention") }}
++                <template v-if="!$root.info.whMaxKeepDays">
++                    {{ $t("infiniteRetention") }}
++                </template>
+             </label>
+             <input
+                 id="keepDataPeriodDays"
+@@ -15,7 +17,8 @@
+                 type="number"
+                 class="form-control"
+                 required
+-                min="0"
++                :min="$root.info.whMaxKeepDays ? 1 : 0"
++                :max="$root.info.whMaxKeepDays || null"
+                 step="1"
+             />
+             <div v-if="settings.keepDataPeriodDays < 0" class="form-text">
