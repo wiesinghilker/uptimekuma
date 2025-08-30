@@ -115,10 +115,24 @@ index cfd65a8a..42de48e4 100644
 -    if (parsedPeriod < 1) {
 -        log.info("clearOldData", `Data deletion has been disabled as period is less than 1. Period is ${parsedPeriod} days.`);
 +    // Apply optional max cap via env (white-label hosting)
- 
-[... omitted 0 of 240 lines ...]
-
-urOffset();
++    const envMaxKeep = parseInt(process.env.UPTIMEKUMA_WH_MAX_KEEP_DAYS || "");
++    let effectivePeriod = parsedPeriod;
++    if (Number.isFinite(envMaxKeep) && envMaxKeep > 0) {
++        if (parsedPeriod < 1) {
++            log.info("clearOldData", `Infinite retention overridden to ${envMaxKeep} days due to UPTIMEKUMA_WH_MAX_KEEP_DAYS.`);
++            effectivePeriod = envMaxKeep;
++        } else if (parsedPeriod > envMaxKeep) {
++            log.info("clearOldData", `Retention capped from ${parsedPeriod} to ${envMaxKeep} days due to UPTIMEKUMA_WH_MAX_KEEP_DAYS.`);
++            effectivePeriod = envMaxKeep;
++        }
++    }
++
++    if (effectivePeriod < 1) {
++        log.info("clearOldData", `Data deletion has been disabled as period is less than 1. Period is ${effectivePeriod} days.`);
+     } else {
+-        log.debug("clearOldData", `Clearing Data older than ${parsedPeriod} days...`);
++        log.debug("clearOldData", `Clearing Data older than ${effectivePeriod} days...`);
+         const sqlHourOffset = Database.sqlHourOffset();
  
          try {
              // Heartbeat
